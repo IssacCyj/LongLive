@@ -16,6 +16,12 @@ from pipeline.causal_inference import CausalInferencePipeline
 import torch.distributed as dist
 from utils.debug_option import DEBUG
 
+import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 class InteractiveCausalInferencePipeline(CausalInferencePipeline):
     def __init__(
@@ -29,6 +35,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+        #self._recache_generator = torch.compile(self.generator, mode="max-autotune")
 
     # Internal helpers
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
@@ -51,10 +58,31 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         if current_start_frame == 0:
             return
         
-        num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
-        recache_start_frame = current_start_frame - num_recache_frames
+        #num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
+        #recache_start_frame = current_start_frame - num_recache_frames
         
-        frames_to_recache = output[:, recache_start_frame:current_start_frame]
+        #frames_to_recache = output[:, recache_start_frame:current_start_frame]
+        
+        recache_stride = 2
+        if self.local_attn_size == -1:
+            num_recache_frames = current_start_frame
+            recache_start_frame = 0
+            frames_to_recache = output[:, recache_start_frame:current_start_frame]
+        else:
+            indices = []
+            for i in range(self.local_attn_size):
+                frame_idx = current_start_frame - 1 - i * recache_stride
+                if frame_idx < 0:
+                    break
+                indices.insert(0, frame_idx)
+            
+            if not indices:
+                return
+
+            frames_to_recache = output[:, indices]
+            recache_start_frame = indices[0]
+            num_recache_frames = len(indices)
+
         # move to gpu
         if frames_to_recache.device.type == 'cpu':
             target_device = next(self.generator.parameters()).device
@@ -79,6 +107,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         # recache
         with torch.no_grad():
+            #self._recache_generator(
             self.generator(
                 noisy_image_or_video=frames_to_recache,
                 conditional_dict=new_conditional_dict,
@@ -102,6 +131,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         text_prompts_list: List[List[str]],
         switch_frame_indices: List[int],
         return_latents: bool = False,
+        profile: bool = False,
         low_memory: bool = False,
     ):
         """Generate a video and switch prompts at specified frame indices.
@@ -142,6 +172,27 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             dtype=noise.dtype
         )
 
+        if profile:
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+            vae_start = torch.cuda.Event(enable_timing=True)
+            vae_end = torch.cuda.Event(enable_timing=True)
+            block_times = []
+            block_start = torch.cuda.Event(enable_timing=True)
+            block_end = torch.cuda.Event(enable_timing=True)
+            denoising_step_times = [[] for _ in range(len(self.denoising_step_list))]
+            kv_update_times = []
+            recache_times = []
+            denoising_step_start = torch.cuda.Event(enable_timing=True)
+            denoising_step_end = torch.cuda.Event(enable_timing=True)
+            kv_update_start = torch.cuda.Event(enable_timing=True)
+            kv_update_end = torch.cuda.Event(enable_timing=True)
+            recache_start = torch.cuda.Event(enable_timing=True)
+            recache_end = torch.cuda.Event(enable_timing=True)
+            init_start.record()
+
         # initialize caches
         local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
         kv_policy = ""
@@ -172,6 +223,11 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
+        if profile:
+            init_end.record()
+            torch.cuda.synchronize()
+            diffusion_start.record()
+
         # temporal denoising by blocks
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0  # current segment index
@@ -186,9 +242,18 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             print("[MultipleSwitch] switch_frame_indices", switch_frame_indices)
 
         for current_num_frames in all_num_frames:
+            if profile:
+                block_start.record()
+
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
+                if profile:
+                    recache_start.record()
                 segment_idx += 1
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+                if profile:
+                    recache_end.record()
+                    torch.cuda.synchronize()
+                    recache_times.append(recache_start.elapsed_time(recache_end))
                 if DEBUG:
                     print(
                         f"[MultipleSwitch] Switch to segment {segment_idx} at frame {current_start_frame}"
@@ -208,6 +273,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
             # ---------------- Spatial denoising loop ----------------
             for index, current_timestep in enumerate(self.denoising_step_list):
+                if profile:
+                    denoising_step_start.record()
                 timestep = (
                     torch.ones([batch_size, current_num_frames],
                     device=noise.device,
@@ -242,23 +309,45 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                if profile:
+                    denoising_step_end.record()
+                    torch.cuda.synchronize()
+                    denoising_step_times[index].append(denoising_step_start.elapsed_time(denoising_step_end))
 
             # Record output
             output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 
+            if profile:
+                kv_update_start.record()
+
             # rerun with clean context to update cache
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+            #context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            #self.generator(
+            #    noisy_image_or_video=denoised_pred,
+            #    conditional_dict=cond_in_use,
+            #    timestep=context_timestep,
+            #    kv_cache=self.kv_cache1,
+            #    crossattn_cache=self.crossattn_cache,
+            #    current_start=current_start_frame * self.frame_seq_length,
+            #)
+            if profile:
+                kv_update_end.record()
+                torch.cuda.synchronize()
+                kv_update_times.append(kv_update_start.elapsed_time(kv_update_end))
+
+                block_end.record()
+                torch.cuda.synchronize()
+                block_times.append(block_start.elapsed_time(block_end))
 
             # Update frame pointer
             current_start_frame += current_num_frames
+
+        if profile:
+            diffusion_end.record()
+            torch.cuda.synchronize()
+            diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+            init_time = init_start.elapsed_time(init_end)
+            vae_start.record()
 
         # Standard decoding
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
@@ -266,4 +355,70 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
         if return_latents:
             return video, output
+
+        if profile:
+            vae_end.record()
+            torch.cuda.synchronize()
+            vae_time = vae_start.elapsed_time(vae_end)
+            total_time = init_time + diffusion_time + vae_time
+            print("Profiling results:")
+            print(f"  - Initialization/caching time: {init_time:.2f} ms ({100 * init_time / total_time:.2f}%)")
+            print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({100 * diffusion_time / total_time:.2f}%)")
+            if block_times:
+                avg_block_time = sum(block_times) / len(block_times)
+                print(f"    - Average block generation time ({self.num_frame_per_block} frames): {avg_block_time:.2f} ms")
+                print(f"    - Average per-frame latency: {avg_block_time / self.num_frame_per_block:.2f} ms")
+                print(f"    - Block generation times (ms): {block_times}")
+
+            for i in range(len(denoising_step_times)):
+                if denoising_step_times[i]:
+                    avg_step_time = sum(denoising_step_times[i]) / len(denoising_step_times[i])
+                    print(f"    - Denoising step {i} average time: {avg_step_time:.2f} ms")
+                    print(f"    - Denoising step {i} times (ms): {denoising_step_times[i]}")
+            if kv_update_times:
+                avg_kv_update_time = sum(kv_update_times) / len(kv_update_times)
+                print(f"    - KV update step average time: {avg_kv_update_time:.2f} ms")
+                print(f"    - KV update step times (ms): {kv_update_times}")
+            if recache_times:
+                print(f"  - Prompt-switch recache time(s): {recache_times} ms")
+            print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
+            print(f"  - Total time: {total_time:.2f} ms")
+
+            # Plotting
+            try:
+                output_folder = '/home/yujiachen/LongLive/plots'
+                if not os.path.exists(output_folder):
+                    os.makedirs(output_folder)
+
+                if block_times:
+                    plt.figure()
+                    plt.plot(block_times)
+                    plt.xlabel("Block index")
+                    plt.ylabel("Latency (ms)")
+                    plt.title("Interactive Block Generation Latency")
+                    plt.savefig(os.path.join(output_folder, "interactive_block_latency.png"))
+                    plt.close()
+
+                if kv_update_times:
+                    plt.figure()
+                    plt.plot(kv_update_times)
+                    plt.xlabel("Block index")
+                    plt.ylabel("Latency (ms)")
+                    plt.title("Interactive KV Update Latency")
+                    plt.savefig(os.path.join(output_folder, "interactive_kv_update_latency.png"))
+                    plt.close()
+
+                plt.figure()
+                for i in range(len(denoising_step_times)):
+                    if denoising_step_times[i]:
+                        plt.plot(denoising_step_times[i], label=f"Step {i}")
+                plt.xlabel("Block index")
+                plt.ylabel("Latency (ms)")
+                plt.title("Interactive Denoising Step Latency")
+                plt.legend()
+                plt.savefig(os.path.join(output_folder, "interactive_denoising_step_latency.png"))
+                plt.close()
+                print(f"Saved latency plots to {output_folder}")
+            except Exception as e:
+                print(f"Error during plotting: {e}")
         return video 

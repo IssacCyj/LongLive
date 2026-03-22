@@ -1,11 +1,11 @@
 # Architecture
 denoising_step_list:
 - 1000
-- 750
 - 500
-- 250
+
+
 warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
-num_frame_per_block: 3
+num_frame_per_block: 6
 model_name: Wan2.1-T2V-1.3B
 model_kwargs:
   local_attn_size: 12

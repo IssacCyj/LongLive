@@ -34,6 +34,7 @@ from utils.dataset import MultiTextDataset
 # ----------------------------- Argument parsing -----------------------------
 parser = argparse.ArgumentParser("Interactive causal inference")
 parser.add_argument("--config_path", type=str, help="Path to the config file")
+parser.add_argument("--profile", action="store_true")
 args = parser.parse_args()
 
 config = OmegaConf.load(args.config_path)
@@ -140,6 +141,15 @@ if low_memory:
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
+
+# ----------------------------- torch.compile -----------------------------
+#if local_rank == 0:
+#    print("Compiling models with torch.compile...")
+#pipeline.generator = torch.compile(pipeline.generator, mode="max-autotune")
+#pipeline.vae = torch.compile(pipeline.vae, mode="max-autotune")
+#if local_rank == 0:
+#    print("Finished compiling models.")
+
 # ----------------------------- Build dataset -----------------------------
 # Parse switch_frame_indices
 if isinstance(config.switch_frame_indices, int):
@@ -200,6 +210,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         text_prompts_list=prompts_list,
         switch_frame_indices=switch_frame_indices,
         return_latents=False,
+        profile=args.profile,
     )
 
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0

@@ -10,6 +10,11 @@ from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, mov
 from utils.debug_option import DEBUG
 import torch.distributed as dist
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
             self,
@@ -104,6 +109,12 @@ class CausalInferencePipeline(torch.nn.Module):
             block_times = []
             block_start = torch.cuda.Event(enable_timing=True)
             block_end = torch.cuda.Event(enable_timing=True)
+            denoising_step_times = [[] for _ in range(len(self.denoising_step_list))]
+            kv_update_times = []
+            denoising_step_start = torch.cuda.Event(enable_timing=True)
+            denoising_step_end = torch.cuda.Event(enable_timing=True)
+            kv_update_start = torch.cuda.Event(enable_timing=True)
+            kv_update_end = torch.cuda.Event(enable_timing=True)
             init_start.record()
 
         # Step 1: Initialize KV cache to all zeros
@@ -153,6 +164,8 @@ class CausalInferencePipeline(torch.nn.Module):
             # Step 2.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
                 # print(f"current_timestep: {current_timestep}")
+                if profile:
+                    denoising_step_start.record()
 
                 # set current timestep
                 timestep = torch.ones(
@@ -186,9 +199,16 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                if profile:
+                    denoising_step_end.record()
+                    torch.cuda.synchronize()
+                    denoising_step_times[index].append(denoising_step_start.elapsed_time(denoising_step_end))
+
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
+            if profile:
+                kv_update_start.record()
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(
                 noisy_image_or_video=denoised_pred,
@@ -200,6 +220,10 @@ class CausalInferencePipeline(torch.nn.Module):
             )
 
             if profile:
+                kv_update_end.record()
+                torch.cuda.synchronize()
+                kv_update_times.append(kv_update_start.elapsed_time(kv_update_end))
+
                 block_end.record()
                 torch.cuda.synchronize()
                 block_time = block_start.elapsed_time(block_end)
@@ -232,10 +256,65 @@ class CausalInferencePipeline(torch.nn.Module):
             print("Profiling results:")
             print(f"  - Initialization/caching time: {init_time:.2f} ms ({100 * init_time / total_time:.2f}%)")
             print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({100 * diffusion_time / total_time:.2f}%)")
-            for i, block_time in enumerate(block_times):
-                print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
+            #for i, block_time in enumerate(block_times):
+            #    print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
+            if block_times:
+                avg_block_time = sum(block_times) / len(block_times)
+                print(f"    - Average block generation time ({self.num_frame_per_block} frames): {avg_block_time:.2f} ms")
+                print(f"    - Average per-frame latency: {avg_block_time / self.num_frame_per_block:.2f} ms")
+                print(f"    - Block generation times (ms): {block_times}")
+                for i, block_time in enumerate(block_times):
+                    print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
+
+            for i in range(len(denoising_step_times)):
+                if denoising_step_times[i]:
+                    avg_step_time = sum(denoising_step_times[i]) / len(denoising_step_times[i])
+                    print(f"    - Denoising step {i} average time: {avg_step_time:.2f} ms")
+                    print(f"    - Denoising step {i} times (ms): {denoising_step_times[i]}")
+            if kv_update_times:
+                avg_kv_update_time = sum(kv_update_times) / len(kv_update_times)
+                print(f"    - KV update step average time: {avg_kv_update_time:.2f} ms")
+                print(f"    - KV update step times (ms): {kv_update_times}")
             print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
             print(f"  - Total time: {total_time:.2f} ms")
+
+            # Plotting
+            try:
+                output_folder = '/home/yujiachen/LongLive/plots'
+                if not os.path.exists(output_folder):
+                    os.makedirs(output_folder)
+
+                if block_times:
+                    plt.figure()
+                    plt.plot(block_times)
+                    plt.xlabel("Block index")
+                    plt.ylabel("Latency (ms)")
+                    plt.title("Block Generation Latency")
+                    plt.savefig(os.path.join(output_folder, "block_latency.png"))
+                    plt.close()
+
+                if kv_update_times:
+                    plt.figure()
+                    plt.plot(kv_update_times)
+                    plt.xlabel("Block index")
+                    plt.ylabel("Latency (ms)")
+                    plt.title("KV Update Latency")
+                    plt.savefig(os.path.join(output_folder, "kv_update_latency.png"))
+                    plt.close()
+
+                plt.figure()
+                for i in range(len(denoising_step_times)):
+                    if denoising_step_times[i]:
+                        plt.plot(denoising_step_times[i], label=f"Step {i}")
+                plt.xlabel("Block index")
+                plt.ylabel("Latency (ms)")
+                plt.title("Denoising Step Latency")
+                plt.legend()
+                plt.savefig(os.path.join(output_folder, "denoising_step_latency.png"))
+                plt.close()
+                print(f"Saved latency plots to {output_folder}")
+            except Exception as e:
+                print(f"Error during plotting: {e}")
 
         if return_latents:
             return video, output.to(noise.device)
